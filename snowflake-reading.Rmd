@@ -1,0 +1,142 @@
+---
+title: 'Snowflake: Reading'
+author: "Charles Lang"
+date: "4/18/2017"
+output: html_document
+---
+## Data Upload & Processing
+```{r}
+#Load libraries
+library(dplyr)
+library(tidyr)
+
+#Load data
+D1 <- read.csv("G3_5cases.csv", header = TRUE)
+#Remove missing values
+D1 <- na.omit(D1)
+#Select item columns
+D2 <- dplyr::select(D1, contains("item"))
+#Convert scores to binary
+D2[D2 > 0] = 1
+D2[D2 <= 0] = 0
+#Append student IDs
+D2$a_studentid <- D1$a_studentid
+#Reshape to long format
+PLOT <- tidyr::gather(D2, "item", "correct", 1:50)
+#Ordering Item Sequence
+  #Remove item label
+  PLOT$item <- gsub("item", "", PLOT$item)
+  #Separate sequence from item identifier
+  PLOT <- tidyr::separate(PLOT, item, c("seq1", "seq2", "identifier"))
+  #Append 0 before single digits
+  PLOT$seq2 <- ifelse(nchar(PLOT$seq2)==1, paste(0,PLOT$seq2, sep = ""),PLOT$seq2)
+  #Combine item sequence fields
+  PLOT <- tidyr::unite(PLOT, sequence, seq1, seq2, identifier, sep = ".", remove = TRUE)
+  #Order by sequence per student
+  PLOT <- dplyr::arrange(PLOT, a_studentid, sequence)
+
+#Create list of students
+  STUDENT.RESULTS <- as.data.frame(unique(PLOT$a_studentid))
+  names(STUDENT.RESULTS) <- c("a_studentid")
+```
+## Snowflake 
+```{r}
+TEMP.STD <- NULL
+FINAL <- NULL
+
+for(i in 1:length(STUDENT.RESULTS$a_studentid)){
+  #Seed
+  cum.acc <- NA
+  cum.over <- NA
+  cum.under <- NA
+  
+  
+  #Subset by student
+  TEMP.STUDENT <- dplyr::filter(PLOT, a_studentid == STUDENT.RESULTS$a_studentid[i])
+  
+  prior <- 0.5
+  
+  #Subset by item
+  for(j in 1:length(TEMP.STUDENT$sequence)){
+    
+    #Generate likelihood
+    L1 <- dplyr::filter(PLOT, sequence == TEMP.STUDENT$sequence[j])
+    likelihood <- mean(L1$correct)
+    
+    #Generate posterior for student
+    posterior <- likelihood*prior/(likelihood*prior + (1-prior)*(1-likelihood))
+  
+    posterior <- ifelse(is.nan(posterior), 0, ifelse(is.na(posterior), 0, posterior))
+    
+    #Predict correct/incorrect for each student
+    pred.score <- ifelse(posterior >= 0.5, 1, 0)
+    
+    #Calculate accuracy
+    accuracy <- ifelse(TEMP.STUDENT$correct[j] == pred.score, 1, 0)
+    
+    over <- ifelse(TEMP.STUDENT$correct[j] < pred.score, 1, 0)
+    
+    under <- ifelse(TEMP.STUDENT$correct[j] > pred.score, 1, 0)
+    
+    cum.acc <- sum(cum.acc, accuracy, na.rm = TRUE)
+    cum.over <- sum(cum.over, over, na.rm = TRUE)
+    cum.under <- sum(cum.under, under, na.rm = TRUE)
+    
+    #Predict the posterior probability of being correct
+    pred.prob.acc <- cum.acc/(cum.acc + cum.over + cum.under)
+                                                           
+    #Predict the posterior probability of over predicting  
+    pred.prob.over <- cum.over/(cum.acc + cum.over + cum.under)
+    
+    pred.prob.over <- ifelse(is.nan(pred.prob.over), 0, ifelse(is.na(pred.prob.over), 0, ifelse(pred.prob.over == 1, 0.999, pred.prob.over)))
+    
+    #Predict the posterior probability of under predicting
+    pred.prob.under <- cum.under/(cum.acc + cum.over + cum.under)
+    
+    pred.prob.under <- ifelse(is.nan(pred.prob.under), 0, ifelse(is.na(pred.prob.under), 0, ifelse(pred.prob.under == 1, 0.999, pred.prob.under)))
+    
+    TEMP.STD <- data.frame(TEMP.STUDENT$a_studentid[j], TEMP.STUDENT$sequence[j], TEMP.STUDENT$correct[j], posterior, pred.score, likelihood, prior, cum.over, cum.under, accuracy, over, under, pred.prob.acc)
+    FINAL <- rbind(FINAL, TEMP.STD)
+    
+    #Generate prior for next round
+    
+    prior <- (prior + pred.prob.under*(1 - prior) - prior*pred.prob.over)
+
+    }
+
+  
+}
+  names(FINAL) <- c("a_studentid", "sequence", "correct", "posterior", "pred.score", "likelihood", "prior", "cum.over", "cum.under", "accuracy", "over", "under", "ppa")
+    
+```
+## Plots
+```{r}
+library(ggplot2)
+
+ggplot(FINAL, aes(sequence, prior, colour = a_studentid, group = a_studentid)) + geom_line() + theme_minimal() + theme(axis.text.x  = element_text(angle=90, size = 8)) + theme(axis.text.x = element_blank()) + scale_colour_discrete(name="student") + ylab("knowledge estimate (prior)")
+
+```
+
+## Model Statistics
+```{r}
+mean.acc <- mean(FINAL$accuracy)
+RMSE <- sqrt(mean((FINAL$accuracy)^2))
+mean.over <- mean(FINAL$over)
+mean.under <- mean(FINAL$under)
+mean.ppa <- mean(FINAL$ppa)
+var.ppa <- var(FINAL$ppa)
+
+row <- c(mean.acc, mean.over, mean.under, RMSE, mean.ppa, var.ppa)
+col <- c("Mean Accuracy", "Mean Over", "Mean Under", "RMSE", "Mean PPA", "Var PPA")
+
+t <- matrix(row)
+rownames(t) = col
+t <- t(t)
+t
+
+```
+
+```{r}
+ggplot(FINAL, aes(ppa)) + geom_histogram(binwidth = 0.05) + theme_minimal()
+```
+
